@@ -4,13 +4,15 @@
   "description": "Local AI Assistant using LM Studio",
   "version": "0.0.1",
   "engines": {
-    "vscode": "^1.108.0"
+    "vscode": "^1.125.0"
   },
   "categories": [
     "Other"
   ],
+  "publisher": "sandeep-bangarh",
   "activationEvents": [
-    "*"
+    "onView:local-ai-chat",
+    "onCommand:local-ai-assistant.askAI"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -39,6 +41,60 @@
           "name": "Chat"
         }
       ]
+    },
+    "configuration": {
+      "title": "Local AI Assistant",
+      "properties": {
+        "local-ai-assistant.provider": {
+          "type": "string",
+          "enum": [
+            "ollama",
+            "lmstudio"
+          ],
+          "enumDescriptions": [
+            "Use a local Ollama model",
+            "Use LM Studio"
+          ],
+          "default": "ollama",
+          "description": "AI provider used by Local AI Assistant"
+        },
+
+        "local-ai-assistant.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama server URL"
+        },
+
+        "local-ai-assistant.ollamaModel": {
+          "type": "string",
+          "default": "qwen3-coder:30b",
+          "description": "Ollama model to use for coding"
+        },
+
+        "local-ai-assistant.ollamaKeepAlive": {
+          "type": "string",
+          "default": "5m",
+          "description": "How long Ollama keeps the model loaded in memory between requests (e.g. \"5m\", \"1h\", or \"0\" to unload immediately). Lower this on memory-constrained machines."
+        },
+
+        "local-ai-assistant.ollamaNumCtx": {
+          "type": "number",
+          "default": 4096,
+          "description": "Context window size (tokens) requested from Ollama. Lower this to reduce memory usage on large models."
+        },
+
+        "local-ai-assistant.lmStudioUrl": {
+          "type": "string",
+          "default": "http://localhost:1234",
+          "description": "LM Studio server URL"
+        },
+
+        "local-ai-assistant.lmStudioModel": {
+          "type": "string",
+          "default": "local-model",
+          "description": "LM Studio model identifier"
+        }
+      }
     }
   },
   "scripts": {
