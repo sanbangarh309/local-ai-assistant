@@ -37,6 +37,7 @@ This extension contributes the following settings:
 * `local-ai-assistant.ollamaNumCtx`: context window size in tokens requested from Ollama (default `4096`).
 * `local-ai-assistant.lmStudioUrl`: LM Studio server URL (default `http://localhost:1234`).
 * `local-ai-assistant.lmStudioModel`: LM Studio model identifier (default `local-model`).
+* `local-ai-assistant.requestTimeoutMs`: how long to wait for a model response before timing out, in milliseconds (default `300000` = 5 minutes).
 
 ## Known Issues
 

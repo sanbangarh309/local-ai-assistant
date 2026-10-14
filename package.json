@@ -93,6 +93,12 @@
           "type": "string",
           "default": "local-model",
           "description": "LM Studio model identifier"
+        },
+
+        "local-ai-assistant.requestTimeoutMs": {
+          "type": "number",
+          "default": 300000,
+          "description": "How long to wait (in milliseconds) for the model to respond before timing out. Large local models can take several minutes, especially on a cold load or a large prompt."
         }
       }
     }

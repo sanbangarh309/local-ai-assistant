@@ -7,6 +7,13 @@ export interface EditPlan {
   }[];
 }
 
+// Built via concatenation (not written as literal lines) so this source file
+// doesn't contain real-looking git merge-conflict markers, which VS Code's
+// conflict detector flags even inside a plain string/template literal.
+export const SEARCH_MARKER = "<".repeat(7) + " SEARCH";
+export const DIVIDER_MARKER = "=".repeat(7);
+export const REPLACE_MARKER = ">".repeat(7) + " REPLACE";
+
 const FILE_BLOCK_RE =
   /FILE:[ \t]*(.+?)[ \t]*\r?\n<{3,}[ \t]*SEARCH[ \t]*\r?\n([\s\S]*?)\r?\n={3,}[ \t]*\r?\n([\s\S]*?)\r?\n>{3,}[ \t]*REPLACE/g;
 

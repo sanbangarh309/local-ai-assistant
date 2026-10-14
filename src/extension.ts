@@ -2,7 +2,14 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { ChatViewProvider } from "./ChatViewProvider";
 import { AIClient } from "./AIClient";
-import { parseEditPlan, type EditPlan } from "./planParser";
+import {
+  parseEditPlan,
+  type EditPlan,
+  SEARCH_MARKER,
+  DIVIDER_MARKER,
+  REPLACE_MARKER,
+} from "./planParser";
+import { resolveFileUri, buildProjectScanContext } from "./workspaceContext";
 
 const aiClient = new AIClient();
 
@@ -27,20 +34,26 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const editor = vscode.window.activeTextEditor;
-
-      if (!editor) {
+      if (!vscode.workspace.workspaceFolders?.length) {
         vscode.window.showErrorMessage(
-          "Open a file first",
+          "No project folder is open. Open a folder/workspace first.",
         );
         return;
       }
 
-      const document = editor.document;
-      const fileName = document.fileName;
-      const code = document.getText();
+      const editor = vscode.window.activeTextEditor;
 
-      const prompt = `
+      // No open file - scan the project for relevant files instead of
+      // requiring the user to open one first.
+      const scan = editor
+        ? undefined
+        : await buildProjectScanContext(question);
+
+      const fileName = editor?.document.fileName;
+      const code = editor?.document.getText() ?? "";
+
+      const prompt = editor
+        ? `
   You are an expert AI software engineer.
 
   Analyze the user request and generate a structured edit plan.
@@ -61,20 +74,56 @@ export function activate(context: vscode.ExtensionContext) {
 
   SUMMARY: Brief description of changes
   FILE: ${fileName}
-  <<<<<<< SEARCH
+  ${SEARCH_MARKER}
   the exact existing lines of code to replace
-  =======
+  ${DIVIDER_MARKER}
   the new lines of code to insert instead
-  >>>>>>> REPLACE
+  ${REPLACE_MARKER}
 
   Rules:
 
   - Repeat the FILE/SEARCH/REPLACE block for each separate change.
   - "SEARCH" must match characters in the code precisely, including indentation.
+  - Keep each SEARCH block as SHORT as possible: only the lines that actually
+    change, plus 1-2 lines of surrounding context. Never reproduce an entire
+    function/file if only a few lines change - split large edits into multiple
+    small FILE/SEARCH/REPLACE blocks instead.
   - Do not invent code that does not exist in the SEARCH block.
   - Do not wrap the response in markdown code fences.
   - Do not add any commentary outside the SUMMARY/FILE/SEARCH/REPLACE blocks.
+  `
+        : `
+  You are an expert AI software engineer.
+
+  No file is currently open, so here is an automated scan of the current project:
+
+  ${scan!.contextBlock}
+
+  User Request:
+  ${question}
+
+  Respond using EXACTLY this plain-text format (not JSON, not markdown):
+
+  SUMMARY: Brief description of changes
+  FILE: exact relative path copied from the project file tree above
+  ${SEARCH_MARKER}
+  the exact existing lines of code to replace
+  ${DIVIDER_MARKER}
+  the new lines of code to insert instead
+  ${REPLACE_MARKER}
+
+  Rules:
+
+  - Only target files that appear in the project file tree above.
+  - Repeat the FILE/SEARCH/REPLACE block for each separate change, even across multiple files.
+  - "SEARCH" must match characters in the code precisely, including indentation.
+  - Do not invent code that does not exist in a file you haven't actually seen -
+    if no snippet was pre-loaded for the file you need, respond with only a
+    SUMMARY explaining what you'd need to see first, and no FILE blocks.
+  - Do not wrap the response in markdown code fences.
+  - Do not add any commentary outside the SUMMARY/FILE/SEARCH/REPLACE blocks.
   `;
+
 
       vscode.window.withProgress(
         {
@@ -141,9 +190,18 @@ export async function applyAgentPlan(plan: EditPlan): Promise<ApplySummary> {
   }
 
   for (const [file, changes] of changesByFile) {
-    const fileUri = vscode.Uri.file(file);
     const baseName = path.basename(file);
+    // The model's FILE path may be relative, differently-cased, or otherwise
+    // mismatched from disk, so resolve it with multiple fallback strategies
+    // instead of assuming it's a valid absolute path.
+    const fileUri = await resolveFileUri(file);
     let document: vscode.TextDocument;
+
+    if (!fileUri) {
+      vscode.window.showErrorMessage(`Could not locate file in workspace: ${file}`);
+      summary.failed.push(file);
+      continue;
+    }
 
     try {
       document = await vscode.workspace.openTextDocument(fileUri);
@@ -156,22 +214,22 @@ export async function applyAgentPlan(plan: EditPlan): Promise<ApplySummary> {
     // Apply each search/replace sequentially against the running text so later
     // hunks see the effect of earlier ones, without touching the real document yet.
     let modifiedText = document.getText();
-    let unmatched = 0;
+    const unmatchedHunks: string[] = [];
     for (const change of changes) {
-      const startIndex = modifiedText.indexOf(change.search);
-      if (startIndex === -1) {
-        unmatched++;
+      const range = findSearchRange(modifiedText, change.search);
+      if (!range) {
+        unmatchedHunks.push(firstLine(change.search));
         continue;
       }
       modifiedText =
-        modifiedText.substring(0, startIndex) +
+        modifiedText.substring(0, range.start) +
         change.replace +
-        modifiedText.substring(startIndex + change.search.length);
+        modifiedText.substring(range.end);
     }
 
-    if (unmatched > 0) {
+    if (unmatchedHunks.length > 0) {
       vscode.window.showWarningMessage(
-        `Could not apply ${unmatched} patch(es) in ${baseName}. Search block(s) not found precisely.`,
+        `Could not apply ${unmatchedHunks.length} patch(es) in ${baseName}. Search block(s) not found: ${unmatchedHunks.join(" | ")}`,
       );
     }
 
@@ -227,3 +285,44 @@ export async function applyAgentPlan(plan: EditPlan): Promise<ApplySummary> {
 }
 
 export function deactivate() {}
+
+function findSearchRange(
+  haystack: string,
+  needle: string,
+): { start: number; end: number } | null {
+  const exactIndex = haystack.indexOf(needle);
+  if (exactIndex !== -1) {
+    return { start: exactIndex, end: exactIndex + needle.length };
+  }
+
+  // Models often drift on indentation/line endings while reproducing a large
+  // block verbatim, so fall back to matching line content with flexible whitespace.
+  const lines = needle.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) {
+    return null;
+  }
+
+  const pattern = lines
+    .map((line) => escapeRegExp(line.trim()))
+    .join("[ \\t]*\\r?\\n[ \\t]*");
+
+  try {
+    const match = new RegExp(pattern).exec(haystack);
+    if (match) {
+      return { start: match.index, end: match.index + match[0].length };
+    }
+  } catch {
+    // Malformed pattern - treat as no match.
+  }
+
+  return null;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function firstLine(text: string): string {
+  const line = text.split(/\r?\n/).find((l) => l.trim().length > 0) ?? text;
+  return line.trim().slice(0, 60);
+}

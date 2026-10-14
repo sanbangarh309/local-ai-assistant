@@ -1,7 +1,18 @@
 import * as vscode from "vscode";
 import { AIClient } from "./AIClient";
 import type { ApplySummary } from "./extension";
-import { parseEditPlan, type EditPlan } from "./planParser";
+import {
+  parseEditPlan,
+  type EditPlan,
+  SEARCH_MARKER,
+  DIVIDER_MARKER,
+  REPLACE_MARKER,
+} from "./planParser";
+import {
+  findFileMentionedInText,
+  buildProjectScanContext,
+  type ProjectScanContext,
+} from "./workspaceContext";
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -49,31 +60,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         webviewView.webview.postMessage({ type: "thinking" });
 
-        let targetFileName = "Unknown";
+        if (!vscode.workspace.workspaceFolders?.length) {
+          webviewView.webview.postMessage({
+            type: "error",
+            text: "❌ No project folder is open. Open a folder/workspace so the agent has something to scan.",
+          });
+          return;
+        }
+
+        let targetFileName: string | undefined;
         let code = "";
         let fileUri: vscode.Uri | undefined = undefined;
 
         // 1. Try to see if the user mentioned a specific file path/name in their text message
         // Matches patterns like "in UserController.php", "update api.php", "src/index.ts"
-        const fileMatch = message.text.match(
-          /(?:in|update|modify|change|file)\s+([a-zA-Z0-9_\-\.\/\\:]+)/i,
-        );
-
-        if (fileMatch && fileMatch[1]) {
-          const searchedName = fileMatch[1].trim();
-          // Search the entire workspace for this file name
-          const foundFiles = await vscode.workspace.findFiles(
-            `**/${searchedName}`,
-            null,
-            1,
-          );
-
-          if (foundFiles.length > 0) {
-            fileUri = foundFiles[0];
-            targetFileName = fileUri.fsPath;
-            const document = await vscode.workspace.openTextDocument(fileUri);
-            code = document.getText();
-          }
+        fileUri = await findFileMentionedInText(message.text);
+        if (fileUri) {
+          targetFileName = fileUri.fsPath;
+          const document = await vscode.workspace.openTextDocument(fileUri);
+          code = document.getText();
         }
 
         // 2. Fallback: If no file was mentioned or found, use the currently active editor file
@@ -90,16 +95,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        // 3. Safety Check: If we still don't have code or a file, alert the user
-        if (!fileUri || code.trim().length === 0) {
-          webviewView.webview.postMessage({
-            type: "error",
-            text: "❌ Could not detect which file to modify. Please open a file or specify its name clearly (e.g., 'in UserController.php').",
-          });
-          return;
+        // 3. Last resort: no file named or open - scan the whole project for
+        // files relevant to the request instead of asking the user to open one.
+        let scan: ProjectScanContext | undefined;
+        if (!fileUri) {
+          scan = await buildProjectScanContext(message.text);
         }
 
-        const prompt = `
+        const prompt = fileUri
+          ? `
 Current File Context:
 Path: ${targetFileName}
 Code Block:
@@ -114,16 +118,49 @@ Task: Generate an edit plan response using EXACTLY this plain-text format (not J
 
 SUMMARY: Short execution log summary
 FILE: ${targetFileName}
-<<<<<<< SEARCH
+${SEARCH_MARKER}
 exact string match block of source code to swap out
-=======
+${DIVIDER_MARKER}
 new lines of code replacing it
->>>>>>> REPLACE
+${REPLACE_MARKER}
 
 Rules:
 - Repeat the FILE/SEARCH/REPLACE block for each separate change.
 - "SEARCH" must match characters in the code precisely, including indentation.
+- Keep each SEARCH block as SHORT as possible: only the lines that actually
+  change, plus 1-2 lines of surrounding context. Never reproduce an entire
+  function/file if only a few lines change - split large edits into multiple
+  small FILE/SEARCH/REPLACE blocks instead.
 - Do not invent code that does not exist in the SEARCH block.
+- Do not wrap the response in markdown code fences.
+- Do not add any commentary outside the SUMMARY/FILE/SEARCH/REPLACE blocks.`
+          : `
+No file is open or named in the request, so here is an automated scan of the current project:
+
+${scan!.contextBlock}
+
+User Intent:
+${message.text}
+
+Task: Pick the single most relevant existing file from the tree above and generate an edit plan response using EXACTLY this plain-text format (not JSON, not markdown):
+
+SUMMARY: Short execution log summary
+FILE: exact relative path copied from the project file tree above
+${SEARCH_MARKER}
+exact string match block of source code to swap out
+${DIVIDER_MARKER}
+new lines of code replacing it
+${REPLACE_MARKER}
+
+Rules:
+- Only target files that appear in the project file tree above.
+- Repeat the FILE/SEARCH/REPLACE block for each separate change, even across multiple files.
+- "SEARCH" must match characters in the code precisely, including indentation.
+- Keep each SEARCH block as SHORT as possible: only the lines that actually
+  change, plus 1-2 lines of surrounding context.
+- Do not invent code that does not exist in a file you haven't actually seen -
+  if no snippet was pre-loaded for the file you need, respond with only a
+  SUMMARY explaining what you'd need to see first, and no FILE blocks.
 - Do not wrap the response in markdown code fences.
 - Do not add any commentary outside the SUMMARY/FILE/SEARCH/REPLACE blocks.`;
 
@@ -153,9 +190,15 @@ Rules:
           return;
         }
 
+        const displayTarget = targetFileName
+          ? vscode.workspace.asRelativePath(targetFileName)
+          : Array.from(new Set(aiPlan.changes.map((c) => c.file)))
+              .map((f) => vscode.workspace.asRelativePath(f))
+              .join(", ");
+
         webviewView.webview.postMessage({
           type: "response",
-          text: `🤖 **Proposed Plan for ${vscode.workspace.asRelativePath(targetFileName)}:** ${aiPlan.summary || "Code updates generated."}\n\nReview the diff and Accept/Reject in the dialog that appears.`,
+          text: `🤖 **Proposed Plan for ${displayTarget}:** ${aiPlan.summary || "Code updates generated."}\n\nReview the diff and Accept/Reject in the dialog that appears.`,
         });
 
         // Pass the plan to the global workspace editor logic, which shows a diff
